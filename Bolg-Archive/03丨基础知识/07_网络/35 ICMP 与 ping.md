@@ -11,244 +11,297 @@
 
 ## 痛点引入
 ***
-网络不通时，大家第一反应是 `ping`。**ping 到底发了什么？为什么它能判断通不通？ICMP 除了 ping 还负责什么？**  
-先别急着把 `ping` 当成一个命令背下来，先看几个具体场景：你 ping 一台主机，显示“目标不可达”，这个提示是谁发回来的？你 ping 通了一台服务器，是不是就说明它的 80 端口一定开着？你 ping 一个域名，显示 `ttl=64`，这个 TTL 是什么，和 IP 首部里的 TTL 是一回事吗？这一章咱们就按“ICMP 报什么、ping 怎么探活”这条线走。
+网络不通，大家第一反应是 `ping`。
+
+你可能会想：**ping 通了，是不是服务就正常了？ping 不通，是不是网就断了？**
+
+先看几个具体场景：
+
+- 你 ping 一台主机，显示“目标不可达”，这个提示是谁发回来的？
+- 你 ping 通了一台服务器，是不是就说明它的 80 端口一定开着？
+- 你 ping 一个域名，显示 `ttl=64`，这个 TTL 是什么，和 IP 首部里的 TTL 是一回事吗？
+
+这一章咱们用一条问题链往前走：
+
+1. IP 包送不到，怎么通知源主机？ICMP 是传输层协议吗？
+2. ping 到底发了什么，为什么它能判断通不通？
+3. ping 通能说明端口开着吗？ping 不通又可能是哪些原因？
+4. ping 显示的 TTL 是什么，跨网段时 MAC 怎么变？
 
 <br>
 
 <br>
 
-## 知识点 1：ICMP 是 IP 的助手
+## 优先级说明
+***
+这篇是 ICMP 与 ping 的核心，面试常问，项目里排查“网络通不通”“端口开不开”也会用到。先分清主次：
+
+**必须掌握（面试常问、项目真用得上）：**
+- ICMP 是网络层协议，封装在 IP 包里，不是传输层
+- ICMP 两大类：查询报文（回送请求/应答等）和差错报文（目标不可达、超时等）
+- ICMP 不负责可靠传输，本身也可能丢，不会重传
+- ping 使用 ICMP 回送请求（类型 8）和回送应答（类型 0）
+- ping 通只说明 ICMP 往返可达，不保证某个 TCP/UDP 端口服务正常
+- ping 不通不一定是断网，可能是 ICMP 被禁或限速
+- 跨网段 ping 时，帧的目的 MAC 是网关，不是最终主机
+- ping 显示的 TTL 是收到报文时的剩余值，不是初始值
+- ICMP 差错报文不会对另一个 ICMP 差错报文再报错，避免循环
+
+**了解即可（知道大概，不展开）：**
+- ICMP 重定向、时间戳请求等具体类型
+- 原始套接字发送 ICMP 的编程细节
+- ICMP 限速和防火墙策略
+- IPv6 下 ICMPv6 的差异
+
+**主线**：IP 送不到 → ICMP 报错或查询 → ping 用类型 8/0 探活 → ping 通只说明 ICMP 可达，不保证端口 → 跨网段问网关 MAC，TTL 是剩余值。
+
+<br>
+
+<br>
+
+## 知识点 1：ICMP 是 IP 的助手——报错与查询，不负责可靠传输
 ***
 ### 问题
+
 IP 包送不到，怎么通知源主机？ICMP 是传输层协议吗？它负责可靠传输吗？ping 通目标主机，能说明目标主机的 80 端口一定开着吗？
 
-<br>
+**你可能会想**：ping 通了，说明对方主机活着，那它的服务应该也能访问吧？
 
-### 方案
-ICMP 是**网络层协议**，封装在 IP 包里，负责报告 IP 包传输中的问题，比如目标不可达、超时、重定向等。它分两类：  
-- **查询报文**：如回送请求/应答、时间戳请求/应答；  
-- **差错报文**：如目标不可达、时间超时、参数问题。  
-关键边界：**ICMP 不负责可靠传输，只负责“报信”**。它本身也可能丢，不会重传；它告诉发送方“为什么没送到”，但不保证一定送到。  
-另外，ICMP 差错报文通常不会对 ICMP 差错报文再发差错，避免无限循环；分片时也只对第一个分片发差错，这些是协议设计上的细节。  
-ping 通只说明 ICMP 往返可达，不保证某个 TCP/UDP 端口服务正常；端口是否开放，要看传输层有没有响应。
+不一定。**ping 通只说明 ICMP 往返可达，不保证某个 TCP/UDP 端口服务正常。** 端口开不开，要看传输层有没有响应。
 
 <br>
 
-### 最小示例
-```text
-路由器找不到目标主机 → 回 ICMP 目标不可达给源主机
-TTL 减到 0 → 回 ICMP 时间超时
-目标主机禁 ICMP → ping 不通，但 TCP 80 可能仍然可用
-```
+### 核心概念与方案
 
-结论：ICMP 是 IP 的报错助手，包没送到，至少告诉你为什么；但它不是“服务探活”的万能工具。
+先把 ICMP 换成你熟悉的场景：**ICMP 是 IP 的报错助手，包没送到，至少告诉你为什么；它不是快递员，不负责把包裹重新送到。**
+
+ICMP 是**网络层协议**，封装在 IP 包里，负责报告 IP 包传输中的问题，比如目标不可达、超时、重定向等。它分两类：
+
+- **查询报文**：如回送请求/应答、时间戳请求/应答。
+- **差错报文**：如目标不可达、时间超时、参数问题。
+
+关键边界：**ICMP 不负责可靠传输，只负责“报信”**。它本身也可能丢，不会重传；它告诉发送方“为什么没送到”，但不保证一定送到。
+
+另外，ICMP 差错报文通常不会对 ICMP 差错报文再发差错，避免无限循环；分片时也只对第一个分片发差错，这些是协议设计上的细节。
+
+**ping 通只说明 ICMP 往返可达，不保证某个 TCP/UDP 端口服务正常；端口是否开放，要看传输层有没有响应。**
 
 <br>
 
-### 一句话本质
-**ICMP 是 IP 的报错助手：包没送到，至少告诉你为什么。**
+### 最小实验：只看 ping 不可达时是谁回的 ICMP
+
+环境前提：Linux/macOS，或 Windows WSL；已安装 `ping` 和 `tcpdump`，抓包需要 `sudo`。下面只在本机回环和局域网内操作，不对外网开放。
+
+终端 1 抓 ICMP：
+
+````bash
+sudo tcpdump -i any -nn icmp -c 5
+````
+
+终端 2 ping 一个不存在的同网段地址：
+
+````bash
+ping -c 1 -W 1 192.168.1.254 || true
+````
+
+**这次只看一件事**：tcpdump 输出里有没有 `ICMP` 和 `unreachable` 字样。
+
+可能看到类似：
+
+````text
+IP 192.168.1.10 > 192.168.1.254: ICMP echo request
+IP 192.168.1.10 > 192.168.1.254: ICMP host 192.168.1.254 unreachable
+````
+
+第二行是**本机或网关回的 ICMP 目标不可达**，不是目标主机回的，因为目标根本不在线。**ICMP 差错报文就是告诉源主机“为什么没送到”。**
+
+如果输出里没有 `unreachable`，可能是地址恰好存在、网络环境不同，换个不存在的地址再试。`tcpdump` 需要权限，**需按环境核实**。
 
 <br>
 
-### 易错点
-坑一：**ICMP 不是传输层协议**，它封装在 IP 里，属于网络层。  
-坑二：**ICMP 本身也可能丢**，ping 不通不一定是网络完全断，也可能是 ICMP 被限速或禁用。  
-坑三：**ping 通只说明 ICMP 往返可达，不保证某个 TCP/UDP 端口服务正常**。  
-坑四：**ping 不通不代表一定断网**，有的主机或防火墙会禁 ICMP，但 TCP 端口仍然可用。  
+### 易错点与边界
+
+坑一：**ICMP 不是传输层协议**，它封装在 IP 里，属于网络层。
+
+坑二：**ICMP 本身也可能丢**，ping 不通不一定是网络完全断，也可能是 ICMP 被限速或禁用。
+
+坑三：**ping 通只说明 ICMP 往返可达，不保证某个 TCP/UDP 端口服务正常**。
+
+坑四：**ping 不通不代表一定断网**，有的主机或防火墙会禁 ICMP，但 TCP 端口仍然可用。
+
 坑五：**ICMP 差错报文不会对 ICMP 差错报文再发差错**，避免循环；别以为每个错误都会触发新的错误消息。
 
 <br>
 
+### 一句话本质
+
+**ICMP 是 IP 的报错助手：包没送到，至少告诉你为什么；它不负责可靠传输，ping 通也不保证端口服务正常。**
+
+<br>
+
 ### 自测
+
 ping 通目标主机，能说明目标主机的 80 端口一定开着吗？为什么 ICMP 差错报文不会对另一个 ICMP 差错报文再报错？
 
-<br>
+<details><summary>答案</summary>不能。ping 通只说明 ICMP 往返可达，不保证某个 TCP/UDP 端口服务正常；端口是否开放，要看传输层有没有响应。ICMP 差错报文不会对另一个 ICMP 差错报文再报错，是为了避免无限循环：如果错误消息本身又触发错误消息，可能形成循环，浪费带宽和资源。</details>
 
 <br>
 
-## 知识点 2：ping 的工作过程
+<br>
+
+## 知识点 2：ping 的工作过程——类型 8 问，类型 0 答，跨网段问网关
 ***
 ### 问题
+
 ping 怎么判断通不通、RTT 多少？ping 用的是 TCP 还是 UDP？请求和应答的 ICMP 类型分别是多少？跨网段时 MAC 怎么变？
+
+**你可能会想**：ping 是不是用了某个端口，像 TCP 一样建立连接？
+
+不是。**ping 使用的是 ICMP，不是 TCP/UDP；它不建立连接，也不探测端口。** 它只是发一个 ICMP 回送请求，等一个回送应答。
 
 <br>
 
-### 方案
-ping 使用 ICMP **回送请求（类型 8）** 和 **回送应答（类型 0）**。  
-过程可以拆成几步：  
-1. 源主机构造 ICMP 回送请求，带标识符和序号，数据区通常放发送时间；  
-2. 交给 IP 层加上源/目标 IP；  
-3. 查 ARP 得到下一跳 MAC，封装成帧发出；跨网段时目的 MAC 是网关 MAC，不是最终主机 MAC；  
-4. 目标主机收到后，协议栈自动回 ICMP 回送应答，序号对应；  
-5. 源主机收到后，用当前时间减发送时间算 RTT；超时没收到就认为不可达或丢包。  
+### 核心概念与方案
+
+先把 ping 换成你熟悉的场景：**ping 就是发一个“你在吗”的 ICMP 请求，等一个“我在”的应答，顺便算往返时间。**
+
+ping 使用 ICMP **回送请求（类型 8）** 和 **回送应答（类型 0）**。过程可以拆成几步：
+
+1. 源主机构造 ICMP 回送请求，带标识符和序号，数据区通常放发送时间。
+2. 交给 IP 层加上源/目标 IP。
+3. 查 ARP 得到下一跳 MAC，封装成帧发出；跨网段时目的 MAC 是网关 MAC，不是最终主机 MAC。
+4. 目标主机收到后，协议栈自动回 ICMP 回送应答，序号对应。
+5. 源主机收到后，用当前时间减发送时间算 RTT；超时没收到就认为不可达或丢包。
+
 注意：ping 的请求和应答走的是 IP 层，不经过 TCP/UDP；所以 ping 通不能替代端口探测。
 
 <br>
 
-### 最小示例
-```text
-ping 192.168.1.2
-→ ICMP Echo Request type=8 seq=0
-← ICMP Echo Reply type=0 seq=0
-→ 计算 RTT
+### 最小实验：只看 ping 输出里的 TTL 和 RTT
 
-跨网段：
-目标 IP = 8.8.8.8，但帧的目的 MAC 是网关 MAC。
-```
+环境前提：同上，已安装 `ping`。下面只在本机回环和局域网内操作。
 
-结论：ping 就是发一个“你在吗”的 ICMP 请求，等一个“我在”的应答，顺便算往返时间。
+先 ping 本机回环：
+
+````bash
+ping -c 3 127.0.0.1
+````
+
+再 ping 局域网网关（换成你实际的网关地址）：
+
+````bash
+ping -c 3 192.168.1.1 || true
+````
+
+**这次只看一件事**：输出里 `ttl=` 和 `time=` 两个字段。
+
+可能看到类似：
+
+````text
+64 bytes from 127.0.0.1: icmp_seq=1 ttl=64 time=0.045 ms
+64 bytes from 192.168.1.1: icmp_seq=1 ttl=64 time=1.23 ms
+````
+
+`ttl=64` 是收到报文时的 TTL 剩余值，不是发送方设置的初始 TTL；`time=` 是 RTT，包含往返路径和中间设备处理时间。
+
+**关键观察点**：`icmp_seq` 对应请求序号，`ttl` 是剩余值，`time` 是往返时间。
+
+如果 ping 不通，先检查目标地址是否在线、网络是否可达；`ping` 参数在不同系统上可能不同，**需按环境核实**。
 
 <br>
 
-### 一句话本质
-**ping 就是发一个“你在吗”的 ICMP 请求，等一个“我在”的应答，顺便算往返时间。**
+### 易错点与边界
 
-<br>
+坑一：**ping 使用的是 ICMP，不是 TCP/UDP**；它不建立连接，也不探测端口。
 
-### 易错点
-坑一：**ping 使用的是 ICMP，不是 TCP/UDP**；它不建立连接，也不探测端口。  
-坑二：**有的主机会禁 ICMP**，所以 ping 不通不代表一定断网；要看 TCP 端口是否可达。  
-坑三：**跨网段会经过路由器和 ARP 换 MAC**，ping 的 IP 不变，但帧的 MAC 每跳都换。  
-坑四：**ping 显示的 `ttl=64` 是收到报文时的 TTL 剩余值**，不是发送方设置的初始 TTL；初始值常见 64、128、255。  
+坑二：**有的主机会禁 ICMP**，所以 ping 不通不代表一定断网；要看 TCP 端口是否可达。
+
+坑三：**跨网段会经过路由器和 ARP 换 MAC**，ping 的 IP 不变，但帧的 MAC 每跳都换。
+
+坑四：**ping 显示的 `ttl=64` 是收到报文时的 TTL 剩余值**，不是发送方设置的初始 TTL；初始值常见 64、128、255。
+
 坑五：**ping 的 RTT 包含往返路径和中间设备处理时间**，不只是一段链路的延迟。
 
 <br>
 
+### 一句话本质
+
+**ping 就是发一个“你在吗”的 ICMP 请求（类型 8），等一个“我在”的应答（类型 0），顺便算 RTT；跨网段时帧的目的 MAC 是网关，不是最终主机。**
+
+<br>
+
 ### 自测
+
 ping 的请求和应答 ICMP 类型分别是多少？跨网段 ping 时，帧的目的 MAC 是目标主机还是网关？
 
-<br>
+<details><summary>答案</summary>ping 的请求是 ICMP 回送请求，类型 8；应答是 ICMP 回送应答，类型 0。跨网段 ping 时，帧的目的 MAC 是网关 MAC，不是最终主机 MAC；最终主机 MAC 在最后一跳才用到。</details>
 
 <br>
 
-## 完整可复现示例：用 C++ 发送 ICMP 回送请求
+<br>
+
+## 完整可复现示例：ping + tcpdump 观察 ICMP 请求和应答
 ***
-下面这个 C++ 程序用原始套接字发送一个 ICMP Echo Request，并接收 Echo Reply，打印类型、序号和 RTT。  
-注意：原始套接字需要 root 权限；不同系统对 ICMP 原始套接字的限制不同。这个示例只演示最小流程，不处理校验和以外的复杂情况。
+你需要 Linux 或 WSL，已安装 `ping` 和 `tcpdump`，抓包需要 `sudo`。下面每个步骤只看一件事，不展开无关字段。
 
-```cpp
-// icmp_ping_demo.cpp
-// 编译：g++ -std=c++17 -O2 icmp_ping_demo.cpp -o icmp_ping_demo
-// 运行：sudo ./icmp_ping_demo 127.0.0.1
-// 环境：Linux/POSIX
+终端 1 抓 ICMP：
 
-#include <arpa/inet.h>
-#include <netinet/ip.h>
-#include <netinet/ip_icmp.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
+````bash
+sudo tcpdump -i any -nn icmp -c 10
+````
 
-#include <cstring>
-#include <iostream>
-#include <string>
+终端 2 ping 本机回环：
 
-// 计算 ICMP 校验和
-uint16_t icmp_checksum(const void* data, int len) {
-    const uint16_t* ptr = static_cast<const uint16_t*>(data);
-    uint32_t sum = 0;
-    while (len > 1) {
-        sum += *ptr++;
-        len -= 2;
-    }
-    if (len == 1) {
-        sum += *reinterpret_cast<const uint8_t*>(ptr);
-    }
-    while (sum >> 16) {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    return static_cast<uint16_t>(~sum);
-}
+````bash
+ping -c 3 127.0.0.1
+````
 
-int main(int argc, char* argv[]) {
-    std::string target = (argc > 1) ? argv[1] : "127.0.0.1";
+可能的 tcpdump 输出：
 
-    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-    if (sock < 0) {
-        std::cerr << "socket failed，需要 root 权限\n";
-        return 1;
-    }
+````text
+IP 127.0.0.1 > 127.0.0.1: ICMP echo request, id ..., seq 1, length 64
+IP 127.0.0.1 > 127.0.0.1: ICMP echo reply, id ..., seq 1, length 64
+IP 127.0.0.1 > 127.0.0.1: ICMP echo request, id ..., seq 2, length 64
+IP 127.0.0.1 > 127.0.0.1: ICMP echo reply, id ..., seq 2, length 64
+````
 
-    sockaddr_in dst{};
-    dst.sin_family = AF_INET;
-    if (inet_pton(AF_INET, target.c_str(), &dst.sin_addr) != 1) {
-        std::cerr << "invalid target\n";
-        close(sock);
-        return 1;
-    }
+**关键观察点**：有没有 `ICMP echo request` 和 `ICMP echo reply`，`seq` 是不是一一对应。
 
-    // 构造 ICMP Echo Request
-    const int packet_size = sizeof(icmphdr) + 16;
-    char packet[packet_size];
-    std::memset(packet, 0, sizeof(packet));
+验证结果：ping 发 `echo request`，目标回 `echo reply`，序号对应；`tcpdump` 能直接看到 ICMP 类型和序号，不用写代码也能验证。
 
-    icmphdr* icmp = reinterpret_cast<icmphdr*>(packet);
-    icmp->type = ICMP_ECHO;
-    icmp->code = 0;
-    icmp->un.echo.id = htons(getpid() & 0xFFFF);
-    icmp->un.echo.sequence = htons(1);
-    std::memset(packet + sizeof(icmphdr), 'A', 16);
-    icmp->checksum = icmp_checksum(packet, packet_size);
+注意：`tcpdump` 需要权限；不同系统上 `ping` 参数和输出格式可能不同；抓包点不同，看到的 ICMP 可能不同，**需按环境核实**。
 
-    timeval send_time{};
-    gettimeofday(&send_time, nullptr);
+<br>
 
-    if (sendto(sock, packet, packet_size, 0,
-               reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) < 0) {
-        std::cerr << "sendto failed\n";
-        close(sock);
-        return 1;
-    }
+<br>
 
-    std::cout << "sent ICMP Echo Request to " << target << "\n";
+## 排障速查表
+***
+| 现象 | 先查什么 | 常用命令/观察点 | 解释 |
+|---|---|---|---|
+| ping 显示“目标不可达” | 是谁回的 ICMP | `tcpdump -i any -nn icmp`；看源 IP | 可能是本机、网关或中间路由器回的目标不可达，不一定是目标主机 |
+| ping 通但端口连不上 | 端口、服务、防火墙 | `curl -v`；`nc -vz 主机 端口` | ping 通只说明 ICMP 可达，不保证 TCP/UDP 端口服务正常 |
+| ping 不通但网页能打开 | 是否禁 ICMP | 直接用 `curl` 或浏览器访问 | 有的主机或防火墙禁 ICMP，但 TCP 端口仍然可用 |
+| ping 延迟忽高忽低 | 路径拥塞、无线干扰 | `ping -c 20` 看 RTT 波动；`mtr` 看逐跳 | RTT 包含往返路径和中间设备处理时间，波动可能来自拥塞或无线 |
+| ping 显示 TTL 很小 | 经过多少跳 | 看 `ttl=` 剩余值；结合初始值估算跳数 | TTL 是剩余值，初始值常见 64、128、255；剩余小说明经过跳数多 |
+| 跨网段 ping 不通 | 默认网关、ARP | `ip route` 看默认网关；`ip neigh` 看网关 MAC | 跨网段要先找到网关 MAC，网关不通则 ping 不出去 |
+| ping 域名解析失败 | DNS | `ping 域名` 报错；`dig 域名` | ping 域名先要 DNS 解析，解析失败和 ICMP 不可达是两层问题 |
+| ICMP 被限速 | 防火墙、路由器策略 | 抓包看请求和应答是否成对 | 有的网络会限速或丢弃 ICMP，ping 结果可能不完整 |
 
-    // 接收回复
-    char recv_buf[1024];
-    sockaddr_in from{};
-    socklen_t from_len = sizeof(from);
+<br>
 
-    ssize_t n = recvfrom(sock, recv_buf, sizeof(recv_buf), 0,
-                         reinterpret_cast<sockaddr*>(&from), &from_len);
-    if (n < 0) {
-        std::cerr << "recvfrom failed\n";
-        close(sock);
-        return 1;
-    }
+<br>
 
-    timeval recv_time{};
-    gettimeofday(&recv_time, nullptr);
-
-    // 跳过 IP 头
-    iphdr* ip = reinterpret_cast<iphdr*>(recv_buf);
-    int ip_header_len = ip->ihl * 4;
-    icmphdr* reply = reinterpret_cast<icmphdr*>(recv_buf + ip_header_len);
-
-    if (reply->type == ICMP_ECHOREPLY) {
-        double rtt_ms = (recv_time.tv_sec - send_time.tv_sec) * 1000.0
-                      + (recv_time.tv_usec - send_time.tv_usec) / 1000.0;
-        std::cout << "got ICMP Echo Reply: type=" << static_cast<int>(reply->type)
-                  << ", seq=" << ntohs(reply->un.echo.sequence)
-                  << ", RTT=" << rtt_ms << " ms\n";
-    } else {
-        std::cout << "got ICMP type=" << static_cast<int>(reply->type)
-                  << " (not echo reply)\n";
-    }
-
-    close(sock);
-    return 0;
-}
-```
-
-输出/现象/结论可能类似：
-
-```text
-sent ICMP Echo Request to 127.0.0.1
-got ICMP Echo Reply: type=0, seq=1, RTT=0.05 ms
-```
-
-验证结果：`type=8` 是回送请求，`type=0` 是回送应答；`seq` 对应请求序号；RTT 是发送和接收时间差。  
-注意：原始套接字需要 root 权限；不同系统对 `IPPROTO_ICMP` 原始套接字的权限限制不同；这个示例只处理 IPv4，没有处理超时、重传和多包统计，重点是看 ICMP 类型和 RTT 的计算方式。
+## 常见误区
+***
+- **把 ICMP 当成传输层协议**：ICMP 封装在 IP 里，属于网络层。
+- **以为 ICMP 能保证可靠传输**：ICMP 只报信，本身也可能丢，不会重传。
+- **以为 ping 通端口就开着**：ping 通只说明 ICMP 可达，不保证 TCP/UDP 端口服务正常。
+- **以为 ping 不通一定断网**：可能是 ICMP 被禁或限速，TCP 端口仍可能可用。
+- **把 ping 的 TTL 当成初始 TTL**：显示的是收到报文时的剩余值，不是发送方设置的初始值。
+- **以为跨网段 ping 问的是目标主机 MAC**：跨网段帧的目的 MAC 是网关，不是最终主机。
+- **以为 ICMP 差错报文会对所有错误再报错**：ICMP 差错报文不会对另一个 ICMP 差错报文再报错，避免循环。
+- **把 ping 和端口探测混为一谈**：ping 走 ICMP，端口探测走 TCP/UDP，是两层的事。
 
 <br>
 
@@ -256,18 +309,31 @@ got ICMP Echo Reply: type=0, seq=1, RTT=0.05 ms
 
 ## 自测三问
 ***
-1. ICMP 的两大类报文是什么？ICMP 是传输层协议吗？  
-2. ping 使用哪两种 ICMP 类型？跨网段时帧的目的 MAC 是目标主机还是网关？  
+1. ICMP 的两大类报文是什么？ICMP 是传输层协议吗？
+2. ping 使用哪两种 ICMP 类型？跨网段时帧的目的 MAC 是目标主机还是网关？
 3. 为什么 ping 通不代表某个 TCP 端口一定可用？ping 不通又可能是什么原因？
 
-<br>
+<details><summary>参考答案</summary>1. ICMP 两大类是查询报文和差错报文；ICMP 是网络层协议，封装在 IP 包里，不是传输层。2. ping 使用 ICMP 回送请求（类型 8）和回送应答（类型 0）；跨网段时帧的目的 MAC 是网关 MAC，不是最终主机 MAC。3. ping 通只说明 ICMP 往返可达，不保证某个 TCP/UDP 端口服务正常；端口是否开放要看传输层有没有响应。ping 不通可能是目标不在线、网络不通、ICMP 被禁或限速、防火墙拦截等原因，不一定是完全断网。</details>
 
 <br>
 
-## 一句话总结全章
+<br>
+
+## 总结
 ***
-**ICMP 是 IP 的报错与查询助手，ping 用类型 8 回送请求和类型 0 回送应答判断目标是否可达并计算 RTT；ping 通只说明 ICMP 可达，不保证具体服务端口正常。**
+**ICMP 是 IP 的报错与查询助手，ping 用类型 8 回送请求和类型 0 回送应答判断目标是否可达并计算 RTT；ping 通只说明 ICMP 可达，不保证具体服务端口正常；跨网段时帧的目的 MAC 是网关，TTL 是收到报文时的剩余值。**
 
+<br>
+
+<br>
+
+## 参考资料
+***
+- RFC 792：Internet Control Message Protocol
+- RFC 1122：Requirements for Internet Hosts — Communication Layers
+- RFC 1812：Requirements for IP Version 4 Routers
+- `man 8 ping`、`man 8 tcpdump`
+- 需按环境核实：`ping` 的参数和输出格式因系统而异；`tcpdump` 抓包需要权限；不同网络对 ICMP 的限速和过滤策略不同；TTL 初始值因操作系统而异；原始套接字发送 ICMP 需要 root 权限，且不同系统限制不同。
 <br>
 
 <br>
